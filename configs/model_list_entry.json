@@ -1,0 +1,30 @@
+{
+  "models": {
+    "minicpm5": {
+      "2b": {
+        "name": "MiniCPM5-2B-NPU2",
+        "url": "https://huggingface.co/julianmb/MiniCPM5-2B-NPU2",
+        "size": 2023518368,
+        "flm_min_version": "0.9.22",
+        "files": [
+          "config.json",
+          "model.q4nx",
+          "tokenizer.json",
+          "tokenizer_config.json"
+        ],
+        "default_context_length": 32768,
+        "max_prefill_len": 4096,
+        "details": {
+          "family": "qwen3",
+          "think": false,
+          "parameter_size": "2B",
+          "quantization_level": "Q4_1"
+        },
+        "label": [
+          "general"
+        ],
+        "footprint": 1.9
+      }
+    }
+  }
+}
