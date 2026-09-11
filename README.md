@@ -158,6 +158,34 @@ Initial speculation was that compiling XRT with `-noert` would bypass the timeou
 ```
 `[-noert]` is strictly a build-time tolerance flag for omitting PCIe Alveo ERT firmware blobs during compilation (and is automatically implied by `[-npu]`). It does not alter the runtime NPU command submission queue or bypass the hardware watchdog.
 
+### Community Reproductions
+
+Independent confirmations tracked in [ROCm/FastFlowLM#712](https://github.com/ROCm/FastFlowLM/issues/712):
+
+**Per-engine depth boundary ([@Platano78](https://github.com/Platano78), same box / firmware / fresh server):**
+
+| Model | Layers | Engine | Decode |
+|---|---|---|---|
+| `qwen3:1.7b` | 28 | qwen3 | 43.3 t/s |
+| `qwen3:4b` | **36** | **qwen3** | **19.8 t/s** |
+| `qwen3.6-moe:35b-a3b` | 40 | qwen3.6-moe | 16.8 t/s |
+| `gemma4-it:e4b` | **42** | gemma4e | 12.7 t/s |
+| `minicpm5:2b` | 42 | **qwen3** | fails |
+
+The `qwen3` engine is fine at 36 layers and fails at 42, while other engines handle 40–42. The boundary is **engine-specific (37–42)**, not a Strix Halo or firmware limit. Substituting the 36-, 40-, and 42-layer `layer.xclbin` binaries all fail identically, so it is not kernel geometry either.
+
+**Containerized / out-of-tree confirmation ([@D-revv](https://github.com/D-revv), Docker in Proxmox LXC, `/dev/accel/accel0` passthrough):** identical timeout with `txn_op_idx = 0xFFFFFFFF`. Ruled out independently:
+
+| Variable | Tested | Result |
+|---|---|---|
+| Kernel driver | in-tree `amdxdna` 0.7 AND out-of-tree v0.17 (`xdna-driver` main) | timeout |
+| NPU firmware | `npu.dev.sbin` AND `npu_7.sbin` (1.1.2.65) | timeout |
+| `force_cmdlist` | 0 and 1 | timeout |
+| `tdr_timeout_ms` | 60000 (watchdog fires at 60 s, job never completes) | timeout |
+| XRT `-noert` | built with it | no effect |
+
+The 60 s TDR result matters: the decode job never retires, so this is a stuck/invalid monolithic submission, not merely a slow one.
+
 ### Path to Resolution
 1. **Multi-Chunk Runlist in `libqwen3_npu.so`:**
    Split the 42-layer forward sequence into two batches of 21 layers (e.g. `runlist_1.execute()` $\to$ `wait()` $\to$ `runlist_2.execute()` $\to$ `wait()`).
