@@ -54,6 +54,21 @@ def run_evaluation(url: str, model: str):
     print(f"QUALITY EVALUATION ON {model} (AMD XDNA 2 NPU)")
     print("=" * 70)
 
+    # Model-identity pre-check (see ROCm/FastFlowLM#716): FLM can serve the
+    # resident model for an unresolvable tag while echoing the request, so
+    # confirm the tag is registered before attributing any output.
+    try:
+        models = requests.get(f"{url}/v1/models", timeout=10).json()
+        listed = [m.get("id", "") for m in models.get("data", [])]
+        if model not in listed:
+            print(f"[WARN] '{model}' not in /v1/models ({listed}). "
+                  f"Outputs below cannot be attributed to MiniCPM5.")
+        else:
+            print(f"[OK] '{model}' registered in /v1/models.")
+    except Exception as e:
+        print(f"[WARN] Could not query /v1/models: {e}. "
+              f"Outputs below cannot be attributed to MiniCPM5.")
+
     for idx, tc in enumerate(TEST_CASES, 1):
         payload = {
             "model": model,
@@ -75,6 +90,11 @@ def run_evaluation(url: str, model: str):
             continue
 
         data = resp.json()
+        served_model = data.get("model", "")
+        if served_model and served_model != model:
+            print(f"[{idx}] {tc['name']} MODEL MISMATCH: requested '{model}', "
+                  f"served '{served_model}'. Output unattributable; skipping.")
+            continue
         choice = data.get("choices", [{}])[0]
         content = choice.get("message", {}).get("content", "")
         usage = data.get("usage", {})

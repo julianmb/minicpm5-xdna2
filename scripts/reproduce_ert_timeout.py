@@ -30,10 +30,21 @@ def main():
     print(f"Testing {args.model} against {endpoint}")
     print("=" * 70)
 
-    # Check server health / model list
+    # Check server health / model list. Per ROCm/FastFlowLM#716, an
+    # unresolvable tag can silently serve the resident model, so verify the
+    # requested tag is registered before attributing the outcome.
     try:
         models_resp = requests.get(f"{args.url}/v1/models", timeout=5)
         print(f"[1/3] Server reachable (HTTP {models_resp.status_code})")
+        try:
+            listed = [m.get("id", "") for m in models_resp.json().get("data", [])]
+            if args.model not in listed:
+                print(f"  [WARN] '{args.model}' not in /v1/models ({listed}). "
+                      f"Outcome below cannot be attributed to MiniCPM5.")
+            else:
+                print(f"  [OK] '{args.model}' registered in /v1/models.")
+        except Exception:
+            print("  [WARN] Could not parse /v1/models; outcome unattributable.")
     except Exception as e:
         print(f"[ERROR] Cannot connect to FLM at {args.url}: {e}")
         print("Please start the server first using ./scripts/run_flm.sh minicpm5:2b 8001")
@@ -62,11 +73,17 @@ def main():
         print(resp.text)
         
         if "ERT_CMD_STATE_TIMEOUT" in resp.text:
-            print("\n[REPRODUCED] Confirmed ERT_CMD_STATE_TIMEOUT reproduced cleanly.")
-            print("Disassembly trace: xrt::runlist::wait() timed out during 42-layer single-batch forward.")
+            print("\n[REPRODUCED] ERT_CMD_STATE_TIMEOUT returned by the server.")
+            print("NOTE: this records an HTTP-level failure signature only; it does not "
+                  "by itself identify the failing kernel or submission depth.")
         elif resp.status_code == 200 and "choices" in resp.json():
-            print("\n[PASSED] Generation succeeded! Output:")
-            print(resp.json()["choices"][0]["message"]["content"])
+            served = resp.json().get("model", "")
+            if served and served != args.model:
+                print(f"\n[UNATTRIBUTABLE] Requested '{args.model}' but response reports "
+                      f"'{served}' (see ROCm/FastFlowLM#716). Output skipped.")
+            else:
+                print("\n[PASSED] Generation succeeded! Output:")
+                print(resp.json()["choices"][0]["message"]["content"])
     except requests.exceptions.Timeout:
         print("\n[TIMEOUT] Request timed out on HTTP client side (>30s).")
     except Exception as e:

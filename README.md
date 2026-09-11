@@ -58,13 +58,13 @@ By replicating KV head 0 four times into indices $[0, 1, 2, 3]$ and KV head 1 fo
 
 Implementation: [`scripts/expand_kv_heads.py`](scripts/expand_kv_heads.py).
 
-### 3. QK-Norm Identity Injection for RMSNorm
+### 3. QK-Norm Loader Shim (Not an Identity) for RMSNorm
 FastFlowLM's Qwen3 engine (`libqwen3_npu.so`) automatically selects the `_gen_mha_seq_d128_q2` kernel when $d_{head} = 128$ and $d_{ffn} = 6144$. However, `libqwen3_npu.so` expects QK-normalization weights:
 `model.layers.{i}.self_attn.q_norm.weight` and `k_norm.weight` ($[128]$ BF16).
 
 Since MiniCPM5-2B does not employ QK-normalization, [`scripts/inject_qk_norm.py`](scripts/inject_qk_norm.py) injects synthetic unit tensors ($\gamma = 1.0$) into `model.q4nx` across all 42 layers:
 $$\text{RMSNorm}(x, \gamma = 1.0) = \frac{x}{\sqrt{\frac{1}{d}\sum_{j=1}^d x_j^2 + \epsilon}} \cdot 1.0$$
-This satisfies the engine loader while preserving numerical precision.
+This satisfies the weight loader but does **not** preserve the original computation: unit scale still normalizes Q and K, so attention scores differ from the un-normalized MiniCPM5 architecture. Output equivalence of this port is **unvalidated**.
 
 ---
 
@@ -86,7 +86,7 @@ python3 llama.cpp/convert_hf_to_gguf.py hf_adapted/ --outfile minicpm5_2b_gqa8_q
 git clone https://github.com/ROCm/FLM_Q4NX_Converter.git
 python3 FLM_Q4NX_Converter/convert.py -i minicpm5_2b_gqa8_q4_0.gguf -o output/ -f qwen3
 
-# 5. Inject synthetic QK-norm identity weights
+# 5. Inject synthetic QK-norm loader-shim weights (unit scale; NOT numerically identical)
 python3 scripts/inject_qk_norm.py output/model.q4nx --layers 42 --head-dim 128
 ```
 

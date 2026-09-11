@@ -9,7 +9,10 @@ and selects the `_gen_mha_seq_d128_q2` kernel. However, libqwen3_npu.so strictly
 Since MiniCPM5-2B has no architectural QK-normalization, this script injects synthetic
 unit tensors (gamma = 1.0) into `model.q4nx` across all 42 transformer layers:
     RMSNorm(x, gamma=1.0) = (x / RMS(x)) * 1.0
-This satisfies the FastFlowLM kernel loader without altering numerical precision.
+This satisfies the FastFlowLM weight loader but does NOT preserve the original
+computation: RMSNorm with unit scale still normalizes Q and K, so attention
+scores differ from a model without QK normalization. Output equivalence of this
+port is unvalidated; treat any generation as unverified.
 """
 
 import sys
