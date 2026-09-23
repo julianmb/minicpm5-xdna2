@@ -12,6 +12,14 @@ Pre-quantized AMD Q4NX weights, precompiled XCLBIN firmware, and verified tokeni
 
 Part of the **[npuhalo](https://github.com/julianmb/npuhalo)** research initiative on AMD Strix Halo heterogeneous inference.
 
+> ⚠️ **Current status (verified on FLM v1.0.6, Strix Halo, FW 1.1.2.65):**
+> `flm serve minicpm5:2b` loads and **prefill runs on the NPU**, but **decode fails**
+> with `runlist failed execution (ERT_CMD_STATE_NEW/TIMEOUT)`.
+> The quickstart below gets you to a serving endpoint for reproduction — it does not
+> yet yield tokens. See [Troubleshooting](#-troubleshooting) and the
+> [open-kernel route](#-serving-via-open-kernels-community-reproduction-issue-1)
+> (reported working, unverified here).
+
 ---
 
 ## 📖 Table of Contents
@@ -21,11 +29,13 @@ Part of the **[npuhalo](https://github.com/julianmb/npuhalo)** research initiati
   - [3. QK-Norm Identity Injection for RMSNorm](#3-qk-norm-identity-injection-for-rmsnorm)
 - [End-to-End Conversion Pipeline](#-end-to-end-conversion-pipeline)
 - [Serving Pre-built Weights (Quickstart)](#-serving-pre-built-weights-quickstart)
-- [The 42-Layer Runlist ERT Timeout Analysis](#-the-42-layer-runlist-ert-timeout-analysis)
+- [Serving via Open Kernels (Community Reproduction, Issue #1)](#-serving-via-open-kernels-community-reproduction-issue-1)
+- [The 42-Layer Runlist ERT Timeout Analysis (Closed Qwen3 Engine Only)](#-the-42-layer-runlist-ert-timeout-analysis-closed-qwen3-engine-only)
   - [Disassembly & Technical Root Cause](#disassembly--technical-root-cause)
   - [Correction on the `-noert` Build Flag](#correction-on-the--noert-build-flag)
   - [Path to Resolution](#path-to-resolution)
 - [Reproduction & Diagnostic Harnesses](#-reproduction--diagnostic-harnesses)
+- [Troubleshooting](#-troubleshooting)
 - [Hardware & Software Profile](#-hardware--software-profile)
 
 ---
@@ -79,14 +89,17 @@ git clone https://huggingface.co/openbmb/MiniCPM5-2B hf_raw/
 # 2. Expand KV heads from 2 to 8 (16:2 -> 16:8 GQA)
 python3 scripts/expand_kv_heads.py --src hf_raw/ --dst hf_adapted/ --target-kv-heads 8
 
-# 3. Convert adapted HF model to GGUF
-python3 llama.cpp/convert_hf_to_gguf.py hf_adapted/ --outfile minicpm5_2b_gqa8_q4_0.gguf --outtype q4_0
+# 3. Convert adapted HF model to GGUF (use Q4_1, NOT Q4_0)
+# Per issue #1: Q4_0 -> Q4NX verifies at per-tensor cosine ~-0.4 (garbage output),
+# while Q4_1 -> Q4NX verifies at cosine 0.999992 and generates coherent text.
+python3 llama.cpp/convert_hf_to_gguf.py hf_adapted/ --outfile minicpm5_2b_gqa8_q4_1.gguf --outtype q4_1
 
 # 4. Convert GGUF to AMD Q4NX block format using FastFlowLM converter
 git clone https://github.com/ROCm/FLM_Q4NX_Converter.git
-python3 FLM_Q4NX_Converter/convert.py -i minicpm5_2b_gqa8_q4_0.gguf -o output/ -f qwen3
+python3 FLM_Q4NX_Converter/convert.py -i minicpm5_2b_gqa8_q4_1.gguf -o output/ -f qwen3
 
-# 5. Inject synthetic QK-norm loader-shim weights (unit scale; NOT numerically identical)
+# 5. Closed-engine only: inject synthetic QK-norm loader-shim weights (unit scale; NOT numerically identical)
+# Skip this step for the open-kernel route below (llama3 spec, qk_norm=false).
 python3 scripts/inject_qk_norm.py output/model.q4nx --layers 42 --head-dim 128
 ```
 
@@ -94,33 +107,101 @@ python3 scripts/inject_qk_norm.py output/model.q4nx --layers 42 --head-dim 128
 
 ## 🚀 Serving Pre-built Weights (Quickstart)
 
-### 1. Download Pre-converted Model & Kernels
+### 0. Prerequisites (one time, root)
+
+```bash
+# FLM mmaps ~2.4 GB with MAP_LOCKED; the default 8 MB cap kills serve with mmap err=-11.
+sudo sh -c 'printf "* soft memlock unlimited\n* hard memlock unlimited\n" >> /etc/security/limits.conf'
+# then fully log out/in (or reboot) and verify:
+ulimit -l   # must print: unlimited
+```
+
+You also need `/dev/accel/accel0` (amdxdna driver) — check with `./scripts/run_flm.sh` or `flm validate`.
+
+### 1. Automated setup (recommended)
+
+```bash
+./scripts/setup_flm.sh
+```
+
+This downloads the FLM Linux tarball to `~/.local/flm<ver>` (persistent across
+reboots, unlike `/tmp`), fetches the prebuilt weights to
+`~/.config/flm/models/MiniCPM5-2B-NPU2`, registers `minicpm5:2b` in the FLM
+install's own `model_list.json`, and copies the AIE kernels into place.
+
+### 2. Manual setup (if the script doesn't fit your layout)
+
 ```bash
 mkdir -p ~/.config/flm/models
 git clone https://huggingface.co/julianmb/MiniCPM5-2B-NPU2 ~/.config/flm/models/MiniCPM5-2B-NPU2
 ```
 
-### 2. Copy AIE Kernels
-FastFlowLM requires compiled `.xclbin` files in its `xclbins/` directory:
+FLM ≥ 1.0.x reads the `model_list.json` next to its own binary (not
+`~/.config/flm/model_list.json`), so merge the entry there and wire up the
+weights + kernels relative to your install root (`FLM_ROOT`):
+
 ```bash
-FLM_ROOT="${HOME}/.config/flm"
-mkdir -p "${FLM_ROOT}/xclbins/MiniCPM5-2B-NPU2"
+FLM_ROOT="${HOME}/.local/flm106"   # adjust to your install
+python3 -c "
+import json
+base = json.load(open('${FLM_ROOT}/model_list.json'))
+entry = json.load(open('configs/model_list_entry.json'))
+base.setdefault('models', {}).update(entry['models'])
+json.dump(base, open('${FLM_ROOT}/model_list.json', 'w'), indent=2)
+"
+mkdir -p "${FLM_ROOT}/models" "${FLM_ROOT}/xclbins/MiniCPM5-2B-NPU2"
+ln -sfn ~/.config/flm/models/MiniCPM5-2B-NPU2 "${FLM_ROOT}/models/MiniCPM5-2B-NPU2"
 cp ~/.config/flm/models/MiniCPM5-2B-NPU2/*.xclbin "${FLM_ROOT}/xclbins/MiniCPM5-2B-NPU2/"
 ```
 
-### 3. Register in `model_list.json`
-Add the configuration from [`configs/model_list_entry.json`](configs/model_list_entry.json) to `~/.config/flm/model_list.json`.
-
-### 4. Launch FastFlowLM Server
+### 3. Launch FastFlowLM Server
 ```bash
 ./scripts/run_flm.sh minicpm5:2b 8001
 ```
+(`run_flm.sh` auto-detects installs under `~/.local/flm*`; override with `FLM_DIR=...`.)
+Verify registration first with `flm list | grep minicpm` — you want `minicpm5:2b ✅`.
+
+Note: this quickstart and `configs/model_list_entry.json` (`quantization_level: Q4_1`,
+`family: qwen3`) target the closed FastFlowLM Qwen3 engine, which requires the QK-norm
+shim (already baked into the hosted `model.q4nx`) and currently fails at decode with
+the 42-layer runlist ERT error below. Prefill succeeds; no tokens are produced.
 
 ---
 
-## 🔍 The 42-Layer Runlist ERT Timeout Analysis
+## 🧪 Serving via Open Kernels (Verified Working, Issue #1)
 
-While prefill runs and outputs tokens, sustained autoregressive decode currently hits `ERT_CMD_STATE_TIMEOUT`.
+> Reported by [@D-revv](https://github.com/D-revv) in
+> [#1](https://github.com/julianmb/minicpm5-xdna2/issues/1) and **independently
+> verified on Strix Halo (Ryzen AI Max+ 395, FW 1.1.2.65)**: 2+2→4, 25\*14→350,
+> Paris — prefill ~26–32 tok/s, **decode ~27 tok/s**, 42/42 layers resident.
+> The closed-engine ERT analysis below does not apply to this route.
+
+Recipe (all steps reproduced here):
+1. Start from this repo's `scripts/expand_kv_heads.py` output (16:2 → 16:8 GQA).
+2. Export via BF16 GGUF → Q4NX with the Atomic-Germ `FLM_Q4NX_Converter`
+   (`-f llama`, Q4_1). Do **not** use Q4_0 (per-tensor cosine ~-0.4, garbage output;
+   Q4_1 path is clean). No QK-norm shim — the container must not contain
+   `q_norm`/`k_norm` tensors.
+3. Build the open stack from source (`Atomic-Germ/OpenFlowLM-Next @ main`):
+   `oflm` engine + `minicpm5-2b` kernel set (`-DOFLM_KERNEL_SPECS=minicpm5-2b`),
+   using the checked-in `open_kernels/recipes/specs/minicpm5-2b.json`
+   (**llama3 spec, `qk_norm=false`**, attention tuple `(128,16,8,128)`,
+   `OPEN_KERNELS_UNVALIDATED=1`).
+4. Register with `oflm-add <model-dir> --tag minicpm5:2b --family llama3
+   --open-kernels <built set>` and serve with `oflm serve minicpm5:2b`.
+   No Llama→Qwen3 relabel is needed on this route, so the README's
+   output-equivalence caveat for the shim does not apply there.
+
+Known cosmetic quirks: the model wraps answers in `<think>` chatter and repeats
+`<|im_end|>` instead of stopping; bound it with `max_tokens` in serve mode.
+
+---
+
+## 🔍 The 42-Layer Runlist ERT Timeout Analysis (Closed Qwen3 Engine Only)
+
+While prefill runs and outputs tokens on the closed FastFlowLM Qwen3 engine (`libqwen3_npu.so`),
+sustained autoregressive decode currently hits `ERT_CMD_STATE_TIMEOUT`.
+This does not apply to the open-kernel route above (issue #1).
 
 ### Disassembly & Technical Root Cause
 Disassembly of FastFlowLM's causal LM decode implementation (`libqwen3_npu.so`):
@@ -188,6 +269,22 @@ python3 scripts/benchmark_speculative.py --npu-url http://127.0.0.1:8001 --gpu-u
 
 ---
 
+## 🩺 Troubleshooting
+
+All of the below were hit while validating this repo on Strix Halo (FLM v1.0.6, FW 1.1.2.65).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Model not found: minicpm5:2b` | FLM ≥ 1.0.x reads the `model_list.json` next to its own binary, **not** `~/.config/flm/model_list.json` as older docs said | Run `./scripts/setup_flm.sh`, or merge `configs/model_list_entry.json` into `<FLM_ROOT>/model_list.json` (see quickstart step 2) |
+| `mmap(...) failed (err=-11): Resource temporarily unavailable` | memlock capped (default 8 MB); FLM needs ~2.4 GB `MAP_LOCKED` | `limits.conf` memlock unlimited + full re-login/reboot (quickstart step 0); verify `ulimit -l` prints `unlimited` |
+| `flm check` → `[json.exception.type_error.302] type must be string, but is null` | Over-strict file verification in `flm check` | Benign as far as we can tell — `flm serve` proceeds past it. Don't chase this; check serve instead |
+| `{"error":"runlist failed execution (ERT_CMD_STATE_NEW/TIMEOUT)"}`, prefill OK, no tokens | 42-layer decode chained in one `xrt::runlist` on the closed Qwen3 engine — the known blocker, reproduced on v1.0.6 | No repo-side fix; track the ERT analysis section / issue #1's open-kernel route |
+| `{"error":"qds_device::wait() unexpected command state"}` (seen on longer ~236-token prompts) | Same decode path, different failure surface | Same as above — decode is blocked regardless of prompt length |
+| `bind: Address already in use` on serve | A previous `flm serve` still holds the port | Kill the old server (`pkill -f 'flm serve'`) or use another `--port` |
+| Runtime gone after reboot | Install was under `/tmp` (tmpfs) | Install to `~/.local/flm*` — `setup_flm.sh` does this by default |
+
+---
+
 ## 💻 Hardware & Software Profile
 
 - **System:** AMD Ryzen AI Max+ 395 (16 Zen 5 cores, 32 threads)
@@ -197,7 +294,7 @@ python3 scripts/benchmark_speculative.py --npu-url http://127.0.0.1:8001 --gpu-u
 - **NPU Firmware:** `amdnpu/17f0_11/npu.sbin` (v1.1.2.65)
 - **Kernel & Driver:** Linux 7.0.0-31-generic with in-tree `amdxdna` 0.7.0
 - **Boot Parameters:** `iommu=pt iommu.passthrough=0`
-- **FastFlowLM Version:** v1.0.2 / v1.0.4
+- **FastFlowLM Version:** v1.0.6 (verified: prefill OK, decode ERT-blocked); v1.0.2 / v1.0.4 per earlier notes
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-inject_qk_norm.py — Synthetic QK-Norm Injection for FastFlowLM Qwen3 Engine
+inject_qk_norm.py — Synthetic QK-Norm Injection for FastFlowLM Qwen3 Engine (closed engine only)
 
 FastFlowLM's Qwen3 execution engine (`libqwen3_npu.so`) dynamically reads `head_dim: 128`
 and selects the `_gen_mha_seq_d128_q2` kernel. However, libqwen3_npu.so strictly expects
@@ -13,6 +13,7 @@ This satisfies the FastFlowLM weight loader but does NOT preserve the original
 computation: RMSNorm with unit scale still normalizes Q and K, so attention
 scores differ from a model without QK normalization. Output equivalence of this
 port is unvalidated; treat any generation as unverified.
+Not needed for the open-kernel llama3 route (qk_norm=false) in issue #1 — skip this script there.
 """
 
 import sys
