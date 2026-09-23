@@ -170,30 +170,73 @@ the 42-layer runlist ERT error below. Prefill succeeds; no tokens are produced.
 
 ## 🧪 Serving via Open Kernels (Verified Working, Issue #1)
 
-> Reported by [@D-revv](https://github.com/D-revv) in
-> [#1](https://github.com/julianmb/minicpm5-xdna2/issues/1) and **independently
-> verified on Strix Halo (Ryzen AI Max+ 395, FW 1.1.2.65)**: 2+2→4, 25\*14→350,
-> Paris — prefill ~26–32 tok/s, **decode ~27 tok/s**, 42/42 layers resident.
-> The closed-engine ERT analysis below does not apply to this route.
+> Independently verified on Strix Halo (Ryzen AI Max+ 395, FW 1.1.2.65):
+> 2+2→4, 25\*14→350, Paris — prefill ~26–32 tok/s, **decode ~27 tok/s**,
+> 42/42 layers resident. The closed-engine ERT analysis below does not apply
+> to this route. Original report by [@D-revv](https://github.com/D-revv) in
+> [#1](https://github.com/julianmb/minicpm5-xdna2/issues/1).
 
-Recipe (all steps reproduced here):
-1. Start from this repo's `scripts/expand_kv_heads.py` output (16:2 → 16:8 GQA).
-2. Export via BF16 GGUF → Q4NX with the Atomic-Germ `FLM_Q4NX_Converter`
-   (`-f llama`, Q4_1). Do **not** use Q4_0 (per-tensor cosine ~-0.4, garbage output;
-   Q4_1 path is clean). No QK-norm shim — the container must not contain
-   `q_norm`/`k_norm` tensors.
-3. Build the open stack from source (`Atomic-Germ/OpenFlowLM-Next @ main`):
-   `oflm` engine + `minicpm5-2b` kernel set (`-DOFLM_KERNEL_SPECS=minicpm5-2b`),
-   using the checked-in `open_kernels/recipes/specs/minicpm5-2b.json`
-   (**llama3 spec, `qk_norm=false`**, attention tuple `(128,16,8,128)`,
-   `OPEN_KERNELS_UNVALIDATED=1`).
-4. Register with `oflm-add <model-dir> --tag minicpm5:2b --family llama3
-   --open-kernels <built set>` and serve with `oflm serve minicpm5:2b`.
-   No Llama→Qwen3 relabel is needed on this route, so the README's
-   output-equivalence caveat for the shim does not apply there.
+### Why the closed-engine instructions failed
+
+Anyone who followed the old quickstart hit, in order: (1) `Model not found`
+(FLM ≥ 1.0 reads the `model_list.json` next to its binary, not
+`~/.config/flm`); (2) `mmap err=-11` (memlock capped at 8 MB, needs
+unlimited + re-login); and finally (3) prefill-OK / decode-dead
+(`ERT_CMD_STATE_*`) — which no setup step can fix. The route below replaces
+the closed engine entirely and scripts every step that was previously manual.
+
+### 0. Prerequisites (one time, root)
+
+Same memlock fix as the closed route (quickstart step 0 above), then re-login:
+`ulimit -l` must print `unlimited`. All other dependencies are staged
+**without sudo** by the setup script (apt download-only closure into
+`~/.local/sysroot`, user-level rustup, source-built `aiebu`).
+
+You need `cmake`, `g++`, `ninja`, `git`, `curl`, `python3` on PATH.
+
+### 1. Build the weights (shim-free Q4NX container)
+
+```bash
+./scripts/build_open_weights.sh
+# outputs ~/.cache/oflm-weights/MiniCPM5-2B-OFLM/model.q4nx (+tokenizer/config)
+```
+
+What it does: `expand_kv_heads.py` (16:2 → 16:8) → BF16 GGUF → Q4NX with
+`-f llama` (Q4_1, **no** QK-norm shim — the open llama3 engine with
+`qk_norm=false` must not see `q_norm`/`k_norm` tensors; the script verifies
+their absence). Override with `SRC_MODEL=` (local dir or HF id),
+`OUT_DIR=`, `FORCE=1`.
+
+### 2. Build the engine + kernels (one command, idempotent)
+
+```bash
+./scripts/setup_oflm.sh
+# uses OUT_DIR above via MODEL_DIR (default: the path from step 1)
+```
+
+This clones `Atomic-Germ/OpenFlowLM-Next`, builds `oflm` and the
+`minicpm5-2b` kernel set (`dx`, `dx_attn`, `ln`, `lm_head_q4`, …) from the
+checked-in `minicpm5-2b.json` spec, builds the XRT runtime mirror, and
+registers the model (`oflm-add … --tag minicpm5:2b --family llama3
+--open-kernels …`). Re-runs skip completed stages. Expect ~15–30 min total
+on first run (engine compile + AIE kernel builds).
+
+### 3. Serve
+
+```bash
+./scripts/run_oflm.sh minicpm5:2b 8001
+```
+
+Then inference as usual, e.g.:
+```bash
+curl -s http://127.0.0.1:8001/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"minicpm5:2b","messages":[{"role":"user","content":"What is 25*14? Answer with just the number."}],"max_tokens":30,"temperature":0.0}'
+```
 
 Known cosmetic quirks: the model wraps answers in `<think>` chatter and repeats
 `<|im_end|>` instead of stopping; bound it with `max_tokens` in serve mode.
+`OPEN_KERNELS_UNVALIDATED=1` is required (set by `oflm_env.sh`, sourced by
+both scripts) for the `(128,16,8,128)` attention tuple.
 
 ---
 
