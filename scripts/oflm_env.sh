@@ -16,10 +16,22 @@
 : "${XRT_ROOT:=${HOME}/.local/xrtroot}"
 # Python venv for the weight pipeline + oflm-add
 : "${OFLM_VENV:=${HOME}/.venvs/npu}"
+# oflm user-level state: config root (registry + models + xclbins)
+: "${OFLM_ROOT:=${HOME}/.config/oflm}"
 # Open-kernel model registry (written by oflm-add)
-: "${OFLM_CONFIG_PATH:=${HOME}/.config/oflm/model_list.json}"
-: "${OFLM_XCLBIN_PATH:=${HOME}/.config/oflm}"
-
+: "${OFLM_CONFIG_PATH:=${OFLM_ROOT}/model_list.json}"
+: "${OFLM_XCLBIN_PATH:=${OFLM_ROOT}}"
+# The runtime resolves models as $OFLM_MODEL_PATH + <registry model_path> + <name>.
+# model_path is "models", so this must be the CONFIG dir, not the models dir —
+# pointing it at .../oflm/models yields .../oflm/models/models/<name>.
+: "${OFLM_MODEL_PATH:=${OFLM_ROOT}}"
+export OFLM_MODEL_PATH
+# Running from a build tree rather than an install prefix: oflm can't find
+# model_info.json beside the binary, and will try to "pull" instead of using
+# the locally registered model.
+if [ -f "${OFLM_SRC}/src/model_info.json" ]; then
+    export OFLM_MODELINFO_PATH="${OFLM_SRC}/src/model_info.json"
+fi
 export OFLM_SRC OFLM_SYSROOT FLM_ROOT XRT_ROOT OFLM_VENV
 export OFLM_CONFIG_PATH OFLM_XCLBIN_PATH
 
@@ -40,4 +52,13 @@ export XILINX_XRT="${XRT_ROOT}"
 : "${OFLM_TOOLS:=${HOME}/src/build-tools}"
 export OFLM_TOOLS
 
-export OFLM_CMAKE_FLAGS="-DOFLM_KERNEL_SPECS=minicpm5-2b -DXRT_INCLUDE_DIR=${OFLM_TOOLS}/XRT/src/runtime_src/core/include -DXRT_LIB_DIR=${FLM_ROOT}/lib -DCMAKE_CXX_STANDARD_LIBRARIES=-lz -lidn2 -DCURL_LIBRARY=${OFLM_SYSROOT}/usr/lib/x86_64-linux-gnu/libcurl.so -DCURL_LIBRARY_RELEASE=${OFLM_SYSROOT}/usr/lib/x86_64-linux-gnu/libcurl.so"
+# Must be an array: CMAKE_CXX_STANDARD_LIBRARIES contains a space, which would
+# word-split if these were a plain string and hand cmake a bare "-lidn2".
+OFLM_CMAKE_FLAGS=(
+    "-DOFLM_KERNEL_SPECS=minicpm5-2b"
+    "-DXRT_INCLUDE_DIR=${OFLM_TOOLS}/XRT/src/runtime_src/core/include"
+    "-DXRT_LIB_DIR=${FLM_ROOT}/lib"
+    "-DCMAKE_CXX_STANDARD_LIBRARIES=-lz -lidn2"
+    "-DCURL_LIBRARY=${OFLM_SYSROOT}/usr/lib/x86_64-linux-gnu/libcurl.so"
+    "-DCURL_LIBRARY_RELEASE=${OFLM_SYSROOT}/usr/lib/x86_64-linux-gnu/libcurl.so"
+)
