@@ -2,6 +2,12 @@
 """
 benchmark_speculative.py — Speculative Drafter Benchmark Harness
 AMD XDNA 2 NPU (MiniCPM5-2B) as Drafter vs AMD Radeon 8060S / 890M iGPU as Target/Verifier
+
+NOTE: the NPU drafter side needs the open-kernel engine
+(`./scripts/run_oflm.sh minicpm5:2b 8001`); the closed engine cannot decode.
+This harness only *times* both endpoints side by side — it does not implement
+real speculative decoding (no accept/reject loop), so read it as a drafter-vs-
+target latency comparison, not a speculative-decoding benchmark.
 """
 
 import time

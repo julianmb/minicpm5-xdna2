@@ -2,6 +2,11 @@
 """
 test_quality.py — Multi-Domain Output Quality Evaluation Harness for MiniCPM5-2B
 
+NOTE: uses /v1/chat/completions, so it works against either runtime
+(`./scripts/run_oflm.sh` for the working open-kernel engine, or
+`./scripts/run_flm.sh` for the closed engine — where decode fails and every
+domain will report the ERT error instead of an output).
+
 Evaluates generation quality across 5 standard domains:
 1. Math & multi-step arithmetic
 2. Logical reasoning & deduction

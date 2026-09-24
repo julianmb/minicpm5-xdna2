@@ -48,12 +48,15 @@ def adapt_model(src_dir: str, dst_dir: str, target_kv_heads: int = 8):
     print(f"[INFO] Saved modified config.json to {dst_dir}")
 
     # 2. Copy auxiliary files
+    # NOTE: *.safetensors are rewritten below, and the index (if any) must be
+    # copied with them or a sharded checkpoint loads as a broken model.
     aux_files = [
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
         "generation_config.json",
-        "chat_template.jinja"
+        "chat_template.jinja",
+        "model.safetensors.index.json",
     ]
     for af in aux_files:
         src_file = os.path.join(src_dir, af)

@@ -29,11 +29,8 @@ Part of the **[npuhalo](https://github.com/julianmb/npuhalo)** research initiati
   - [3. QK-Norm Identity Injection for RMSNorm](#3-qk-norm-identity-injection-for-rmsnorm)
 - [End-to-End Conversion Pipeline](#-end-to-end-conversion-pipeline)
 - [Serving Pre-built Weights (Quickstart)](#-serving-pre-built-weights-quickstart)
-- [Serving via Open Kernels (Community Reproduction, Issue #1)](#-serving-via-open-kernels-community-reproduction-issue-1)
-- [The 42-Layer Runlist ERT Timeout Analysis (Closed Qwen3 Engine Only)](#-the-42-layer-runlist-ert-timeout-analysis-closed-qwen3-engine-only)
-  - [Disassembly & Technical Root Cause](#disassembly--technical-root-cause)
-  - [Correction on the `-noert` Build Flag](#correction-on-the--noert-build-flag)
-  - [Path to Resolution](#path-to-resolution)
+- [Serving via Open Kernels (Verified Working, Issue #1)](#-serving-via-open-kernels-verified-working-issue-1)
+- [The Closed-Engine Decode Failure (Analysis)](#-the-closed-engine-decode-failure-analysis)
 - [Reproduction & Diagnostic Harnesses](#-reproduction--diagnostic-harnesses)
 - [Troubleshooting](#-troubleshooting)
 - [Hardware & Software Profile](#-hardware--software-profile)
@@ -100,8 +97,15 @@ python3 FLM_Q4NX_Converter/convert.py -i minicpm5_2b_gqa8_q4_1.gguf -o output/ -
 
 # 5. Closed-engine only: inject synthetic QK-norm loader-shim weights (unit scale; NOT numerically identical)
 # Skip this step for the open-kernel route below (llama3 spec, qk_norm=false).
+# Note: if you started from the prebuilt HF weights, the shim is ALREADY baked
+# into model.q4nx (verified: 42 layers ship q_norm/k_norm), so step 5 is a
+# no-op there. It only applies when converting from scratch as above.
 python3 scripts/inject_qk_norm.py output/model.q4nx --layers 42 --head-dim 128
 ```
+
+If you did not write step 3/4 yourself, just use the prebuilt container instead —
+`./scripts/build_open_weights.sh` (open-kernel route) or the HF model repo
+(closed-engine route, shim included).
 
 ---
 
@@ -233,72 +237,71 @@ curl -s http://127.0.0.1:8001/v1/chat/completions -H "Content-Type: application/
   -d '{"model":"minicpm5:2b","messages":[{"role":"user","content":"What is 25*14? Answer with just the number."}],"max_tokens":30,"temperature":0.0}'
 ```
 
-Known cosmetic quirks: the model wraps answers in `<think>` chatter and repeats
-`<|im_end|>` instead of stopping; bound it with `max_tokens` in serve mode.
+Known cosmetic quirks: the model wraps answers in `<think>` chatter, and the
+open engine does not stop at end-of-turn — it streams `<|im_end|>` repeatedly
+until `max_tokens`. **Always bound `max_tokens` tightly**: a 3-token answer
+costs 13 s (~300 tokens at ~25 tok/s) instead of 2 s (`max_tokens: 24`).
+
+`stop` and `stop_token_ids` are accepted by the API but **ignored** by this
+runtime — `max_tokens` is the only working stop condition. (Measured: a stop
+string of `["<|im_end|>"]` and `stop_token_ids: [130073]` both still ran to
+the full 300-token cap.)
+
+This is a runtime stop-condition gap, not a model or weight problem — the
+answer text itself is correct.
+
 `OPEN_KERNELS_UNVALIDATED=1` is required (set by `oflm_env.sh`, sourced by
 both scripts) for the `(128,16,8,128)` attention tuple.
 
 ---
 
-## 🔍 The 42-Layer Runlist ERT Timeout Analysis (Closed Qwen3 Engine Only)
+## 🔍 The Closed-Engine Decode Failure (Analysis)
 
-While prefill runs and outputs tokens on the closed FastFlowLM Qwen3 engine (`libqwen3_npu.so`),
-sustained autoregressive decode currently hits `ERT_CMD_STATE_TIMEOUT`.
-This does not apply to the open-kernel route above (issue #1).
+**If you only want to run the model, skip this section** — use the
+[open-kernel route](#-serving-via-open-kernels-verified-working-issue-1) above.
 
-### Disassembly & Technical Root Cause
-Disassembly of FastFlowLM's causal LM decode implementation (`libqwen3_npu.so`):
-```asm
-qwen3_npu::Impl::forward(int):
-  ...
-  call 24510 <xrt::runlist::execute()@plt>
-  mov  %r12, %rsi
-  mov  %r14, %rdi
-  call 24710 <xrt::runlist::wait(std::chrono::duration<long, std::ratio<1l, 1000l> > const&) const@plt>
-```
+**What is established (verified on Strix Halo, FLM v1.0.1–v1.0.6):**
+prefill completes on the NPU; the first decode token fails with
+`runlist failed execution (ERT_CMD_STATE_TIMEOUT / ERT_CMD_STATE_NEW)`, or
+`qds_device::wait() unexpected command state` on longer prompts. Disassembly
+shows decode dispatching through `xrt::runlist::execute()` → `wait()` in
+`libqwen3_npu.so` (a closed binary; the public source has only the class
+declaration, so the batching logic cannot be patched from outside).
 
-1. **Prefill (`_prefill_with_mv`) Succeeds:**
-   ```text
-   [FLM]  Start prefill...
-   [FLM]  Prefill chunk 1/1 with 38 tokens
-   [FLM]  Creating checkpoint at context length 38
-   ```
-   Prefill chunks matrix-vector computations layer-by-layer or chunk-by-chunk using `mm.xclbin`.
+**What is *not* established — earlier claims here were withdrawn:**
+- *Not* the `-noert` build flag. It is a build-time tolerance flag for
+  omitting Alveo ERT blobs and does not change runtime submission. Rebuilding
+  XRT with it changes nothing.
+- *Not* a driver/firmware/XRT-version problem. Sweeps over in-tree vs
+  out-of-tree `amdxdna`, NPU firmware 1.0 vs 1.1, `force_cmdlist`, TDR
+  timeout, and FLM versions all fail identically ([ROCm/FastFlowLM#712]).
+- *Not* a proven "37–42 layer boundary." That comparison was uncontrolled
+  (differing weights, vocabulary, conversion). The only established fact is
+  that **engines differ**: `qwen3:4b` (36 layers) decodes at 19.8 tok/s on the
+  same `qwen3` engine, and `gemma4-it:e4b` (42 layers) at 12.7 tok/s on
+  `gemma4e` — so 42 layers is not a platform ceiling.
+- Kernel geometry is not it either: swapping in 36-, 40- and 42-layer
+  `layer.xclbin` binaries fails identically.
 
-2. **Decode (`Start generating...`) Stalls:**
-   In `libqwen3_npu.so`, decode constructs a single chained `xrt::runlist` encompassing the forward operations for **all layers in the network**.
-   - MiniCPM5-2B has **42 layers** and borrows `layer.xclbin` and `attn.xclbin` from `Qwen3-1.7B` (which was compiled for **28 layers**).
-   - Dispatching 42 sequential layer executions in a single synchronous runlist batch overruns the hardware command processor buffer depth / timeout threshold of the AIE firmware (`1.1.2.65`) and Linux `amdxdna 0.7` driver.
-   - `xrt::runlist::wait()` times out, returning:
-     ```json
-     {"error":"runlist failed execution (ERT_CMD_STATE_TIMEOUT)"}
-     ```
-
-### Correction on the `-noert` Build Flag
-Initial speculation was that compiling XRT with `-noert` would bypass the timeout. Community testing by [@Platano78](https://github.com/Platano78) established that:
-```text
-[-noert]   Do not treat missing ERT FW as a build error
-[-npu]     Build for NPU only, implies -noert and disables bundling of Alveo Linux drivers
-```
-`[-noert]` is strictly a build-time tolerance flag for omitting PCIe Alveo ERT firmware blobs during compilation (and is automatically implied by `[-npu]`). It does not alter the runtime NPU command submission queue or bypass the hardware watchdog.
-
-### Path to Resolution
-1. **Multi-Chunk Runlist in `libqwen3_npu.so`:**
-   Split the 42-layer forward sequence into two batches of 21 layers (e.g. `runlist_1.execute()` $\to$ `wait()` $\to$ `runlist_2.execute()` $\to$ `wait()`).
-2. **Dedicated 42-Layer AIE Kernel Compilation:**
-   Compile native `layer.xclbin` and `attn.xclbin` graphs calibrated for 42-layer execution depth.
-
-Until one of these upstream updates lands, 24–28 layer models (`Qwen3-1.7B`, `Qwen3.5-0.8B`, `Llama-3.2-1B`) represent the verified operational ceiling on AMD Strix Halo NPU.
+**Proposed-but-unproven fixes** (require AMD to ship a new `libqwen3_npu.so`):
+splitting the 42-layer forward into two 21-layer sub-runlists, or dedicated
+42-layer kernels. Meanwhile the open engine sidesteps the whole path by
+running the layer list host-side.
 
 ---
 
 ## 🔬 Reproduction & Diagnostic Harnesses
+
+These hit any OpenAI-compatible server. Point `--url` at `./scripts/run_oflm.sh`
+for the working open-kernel engine, or `./scripts/run_flm.sh` to reproduce the
+closed-engine ERT failure.
 
 ### 1. Minimal ERT Timeout Reproducer
 Verifies prefill success vs decode timeout against a running FLM instance in under 10 seconds:
 ```bash
 python3 scripts/reproduce_ert_timeout.py --url http://127.0.0.1:8001
 ```
+(Closed-engine diagnostic only — on `oflm` it reports generation succeeding.)
 
 ### 2. Multi-Domain Output Quality Test
 ```bash
@@ -309,6 +312,8 @@ python3 scripts/test_quality.py --url http://127.0.0.1:8001
 ```bash
 python3 scripts/benchmark_speculative.py --npu-url http://127.0.0.1:8001 --gpu-url http://127.0.0.1:8012
 ```
+Times drafter and target side by side; it does not implement an accept/reject
+speculative loop.
 
 ---
 
