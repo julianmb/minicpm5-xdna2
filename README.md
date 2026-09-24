@@ -5,22 +5,101 @@
 [![FastFlowLM](https://img.shields.io/badge/Runtime-FastFlowLM_%E2%89%A5_v0.9.22-green)](https://github.com/ROCm/FastFlowLM)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-This repository contains the end-to-end porting pipeline, architectural adaptations, FastFlowLM configurations, and diagnostic/reproduction harnesses for running **[openbmb/MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B)** on the **AMD XDNA 2 NPU** (`/dev/accel/accel0`, 48 AIE-ML tiles) on **AMD Strix Halo (Ryzen AI Max+ 395)**.
+This repository contains the end-to-end porting pipeline, architectural adaptations, runtime configurations, and diagnostic harnesses for running **[openbmb/MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B)** on the **AMD XDNA 2 NPU** (`/dev/accel/accel0`) on **AMD Strix Halo** (Ryzen AI Max+ 395) and other XDNA 2 parts.
 
-Pre-quantized AMD Q4NX weights, precompiled XCLBIN firmware, and verified tokenizers are hosted on Hugging Face:
-👉 **[huggingface.co/julianmb/MiniCPM5-2B-NPU2](https://huggingface.co/julianmb/MiniCPM5-2B-NPU2)**
+## ✅ Status: it works
+
+Verified on Strix Halo (Ryzen AI Max+ 395, NPU FW 1.1.2.65, amdxdna 0.7, Linux 7.0), running entirely on the NPU:
+
+| | Result |
+|---|---|
+| Decode | **~27 tok/s**, 42/42 layers resident |
+| Prefill | ~26–32 tok/s |
+| Correctness | `2+2`→`4`, `25*14`→`350`, capital of France→`Paris` |
+| Power | NPU-only; iGPU and CPU cores stay free |
+
+This uses the **open-kernel engine** (`Atomic-Germ/OpenFlowLM-Next`). AMD's
+closed FastFlowLM engine loads and prefills fine but **cannot decode** this
+model (a runlist failure in the closed `libqwen3_npu.so`); that path is kept
+here for reproduction only — see [Closed-Engine Decode Failure](#-the-closed-engine-decode-failure-analysis).
+
+## 🚀 Quick start
+
+```bash
+git clone https://github.com/julianmb/minicpm5-xdna2
+cd minicpm5-xdna2
+```
+
+**0. One root step (required).** The NPU runtime needs ~2.4 GB of locked
+memory; the default 8 MB cap makes serving fail with `mmap err=-11`:
+
+```bash
+sudo sh -c 'printf "* soft memlock unlimited\n* hard memlock unlimited\n" >> /etc/security/limits.conf'
+```
+
+Then **log out and back in** (or reboot) — limits only apply to new sessions.
+Confirm: `ulimit -l` must print `unlimited`.
+
+**1. Build the weights** (~10 min; downloads ~4.7 GB, converts to Q4_1).
+Creates its own Python venv on first run.
+
+```bash
+./scripts/build_open_weights.sh
+```
+
+**2. Build the engine + NPU kernels** (~15–30 min; compiles `oflm` and the
+AIE kernels from source). No `sudo` needed — dependencies are staged into
+`~/.local/sysroot`. Safe to re-run; finished stages are skipped.
+
+```bash
+./scripts/setup_oflm.sh
+```
+
+**3. Serve**
+
+```bash
+./scripts/run_oflm.sh minicpm5:2b 8001
+```
+
+**4. Ask it something**
+
+```bash
+curl -s http://127.0.0.1:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"minicpm5:2b","messages":[{"role":"user","content":"What is 25*14? Answer with just the number."}],
+       "max_tokens":24,"temperature":0.0}'
+```
+
+> **Always set a tight `max_tokens`.** The engine does not stop at
+> end-of-turn — it streams `<|im_end|>` until the cap. `stop` and
+> `stop_token_ids` are accepted but ignored. A 3-token answer costs 13 s at
+> `max_tokens: 300` versus 2 s at `max_tokens: 24`.
+
+**Requirements:** Linux with an XDNA 2 NPU (`/dev/accel/accel0`), plus
+`cmake`, `g++`, `ninja`, `git`, `curl`, `python3`, and `apt-get` (used
+download-only, never installing). Roughly 25 GB of disk and ~8 GB of
+downloads for a full first run.
+
+<details>
+<summary>Stuck? Common failures</summary>
+
+| Symptom | Fix |
+|---|---|
+| `mmap(...) failed (err=-11)` | memlock step 0 above, then re-login |
+| `[ERROR] Memlock limit is too low` | same |
+| `No such device with index '0'` | NPU not visible; check `ls /dev/accel/` |
+| `Not a git repository` from a helper script | run the scripts from the repo root |
+| Decode returns nothing / ERT error | you're on the closed engine — use `run_oflm.sh`, not `run_flm.sh` |
+
+More in [Troubleshooting](#-troubleshooting).
+</details>
+
+---
 
 Part of the **[npuhalo](https://github.com/julianmb/npuhalo)** research initiative on AMD Strix Halo heterogeneous inference.
 
-> ⚠️ **Current status (verified on FLM v1.0.6, Strix Halo, FW 1.1.2.65):**
-> `flm serve minicpm5:2b` loads and **prefill runs on the NPU**, but **decode fails**
-> with `runlist failed execution (ERT_CMD_STATE_NEW/TIMEOUT)`.
-> The quickstart below gets you to a serving endpoint for reproduction — it does not
-> yet yield tokens. See [Troubleshooting](#-troubleshooting) and the
-> [open-kernel route](#-serving-via-open-kernels-community-reproduction-issue-1)
-> (reported working, unverified here).
-
----
+<details>
+<summary>Porting details, closed-engine quickstart, analysis and harnesses</summary>
 
 ## 📖 Table of Contents
 - [The Porting Story: Overcoming Hardware Constraints](#-the-porting-story-overcoming-hardware-constraints)
@@ -349,5 +428,9 @@ All of the below were hit while validating this repo on Strix Halo (FLM v1.0.6, 
 ## 📄 License & Citations
 - Base Model weights and architecture: [OpenBMB Apache 2.0](https://github.com/OpenBMB/MiniCPM)
 - Code and configurations in this repository: [Apache 2.0](LICENSE)
-- FastFlowLM runtime: [ROCm FastFlowLM](https://github.com/ROCm/FastFlowLM)
+- Open kernel engine and kernels: [Atomic-Germ/OpenFlowLM-Next](https://github.com/Atomic-Germ/OpenFlowLM-Next)
+- Closed FastFlowLM runtime (reproduction path only): [ROCm FastFlowLM](https://github.com/ROCm/FastFlowLM)
+- Prebuilt Q4NX weights + AIE kernels: [huggingface.co/julianmb/MiniCPM5-2B-NPU2](https://huggingface.co/julianmb/MiniCPM5-2B-NPU2)
 - Research and benchmark records: [julianmb/npuhalo](https://github.com/julianmb/npuhalo)
+
+</details>

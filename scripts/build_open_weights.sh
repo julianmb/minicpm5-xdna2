@@ -34,10 +34,26 @@ echo "     src: ${SRC_MODEL}"
 echo "     out: ${OUT_DIR}"
 echo "=================================================="
 
-[ -x "${PY}" ] || { echo "[ERROR] No python at ${PY}. Create it and install: torch safetensors numpy gguf transformers sentencepiece huggingface_hub einops accelerate"; exit 1; }
+# 0. Python environment — created and populated on first run.
+PY_DEPS="torch safetensors numpy gguf transformers sentencepiece huggingface_hub einops accelerate"
+if [ ! -x "${PY}" ]; then
+    echo "[INFO] Creating venv at ${OFLM_VENV} (first run, ~2 GB with torch)..."
+    python3 -m venv "${OFLM_VENV}"
+    "${PY}" -m pip install --quiet --upgrade pip
+    # CPU-only torch keeps this from pulling a multi-GB CUDA wheel
+    "${PY}" -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+    # shellcheck disable=SC2086
+    "${PY}" -m pip install --quiet ${PY_DEPS}
+fi
+missing=""
 for mod in torch safetensors gguf transformers sentencepiece huggingface_hub; do
-    "${PY}" -c "import ${mod}" 2>/dev/null || { echo "[ERROR] python module '${mod}' missing in ${OFLM_VENV}. pip-install it first."; exit 1; }
+    "${PY}" -c "import ${mod}" 2>/dev/null || missing="${missing} ${mod}"
 done
+if [ -n "${missing}" ]; then
+    echo "[ERROR] Missing python modules in ${OFLM_VENV}:${missing}"
+    echo "        Fix: ${PY} -m pip install${missing}"
+    exit 1
+fi
 
 mkdir -p "${WORK_DIR}" "${OFLM_TOOLS}"
 [ -f "${LLAMA_DIR}/convert_hf_to_gguf.py" ] || git clone --depth 1 https://github.com/ggerganov/llama.cpp "${LLAMA_DIR}"
