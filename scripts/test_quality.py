@@ -24,7 +24,7 @@ TEST_CASES = [
     {
         "name": "Math & Multi-step Calculation",
         "prompt": "A farmer has 15 cows and 25 chickens. How many total legs are on the farm? Show your step-by-step calculation.",
-        "max_tokens": 200,
+        "max_tokens": 400,  # this answer runs ~320 tokens; a lower cap truncates it
         "temperature": 0.0
     },
     {
@@ -111,7 +111,13 @@ def run_evaluation(url: str, model: str):
         print(f"\n--- Test {idx}: {tc['name']} ---")
         print(f"Prompt: {tc['prompt']}")
         print(f"Output:\n{content.strip()}")
-        print(f"\n[Metrics] TTFT: {ttft:.3f}s | Prefill: {prefill_speed:.1f} tok/s | Decode: {decode_speed:.1f} tok/s | Total: {elapsed:.2f}s")
+        # finish_reason is the only reliable truncation signal: a capped answer
+        # is indistinguishable from a complete one without it.
+        finish = choice.get("finish_reason", "?")
+        if finish == "length":
+            print(f"\n[TRUNCATED] hit max_tokens={tc['max_tokens']} — answer is incomplete, raise the cap.")
+        print(f"\n[Metrics] TTFT: {ttft:.3f}s | Prefill: {prefill_speed:.1f} tok/s | Decode: {decode_speed:.1f} tok/s | "
+              f"Tokens: {usage.get('completion_tokens', '?')} | Finish: {finish} | Total: {elapsed:.2f}s")
         print("-" * 70)
 
     print("\nQuality Evaluation Finished!")

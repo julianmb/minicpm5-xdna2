@@ -32,6 +32,15 @@ export OFLM_MODEL_PATH
 if [ -f "${OFLM_SRC}/src/model_info.json" ]; then
     export OFLM_MODELINFO_PATH="${OFLM_SRC}/src/model_info.json"
 fi
+# Pinned upstream revisions. "Works" is only meaningful against a known tree:
+# OpenFlowLM-Next main is active development and the FLM release tarball is
+# replaced in place. Override to move forward deliberately.
+#   c23b1a5 = OpenFlowLM-Next rev verified end-to-end (cold start + inference)
+: "${OFLM_SRC_REF:=c23b1a57f23b6342457b8099ef1f14e3d73f4d47}"
+: "${FLM_VERSION:=v1.0.6}"
+: "${MODEL_REV:=main}"
+export OFLM_SRC_REF FLM_VERSION MODEL_REV
+
 export OFLM_SRC OFLM_SYSROOT FLM_ROOT XRT_ROOT OFLM_VENV
 export OFLM_CONFIG_PATH OFLM_XCLBIN_PATH
 

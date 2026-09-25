@@ -175,7 +175,18 @@ else
 fi
 
 # ---- 6. OpenFlowLM-Next: clone, configure, build `oflm` -----------------------
-[ -d "${OFLM_SRC}/open_kernels" ] || git clone --recursive https://github.com/Atomic-Germ/OpenFlowLM-Next "${OFLM_SRC}"
+if [ ! -d "${OFLM_SRC}/open_kernels" ]; then
+    say INFO "cloning OpenFlowLM-Next @ ${OFLM_SRC_REF:0:12} (pinned)"
+    git clone --recursive https://github.com/Atomic-Germ/OpenFlowLM-Next "${OFLM_SRC}"
+    (cd "${OFLM_SRC}" && git fetch --depth 1 origin "${OFLM_SRC_REF}" && git checkout --detach FETCH_HEAD)
+fi
+if [ -d "${OFLM_SRC}/.git" ]; then
+    have="$(git -C "${OFLM_SRC}" rev-parse HEAD)"
+    if [ "${have}" != "${OFLM_SRC_REF}" ]; then
+        say WARN "OpenFlowLM-Next is at ${have:0:12}, pinned ref is ${OFLM_SRC_REF:0:12}"
+        say WARN "Set OFLM_SRC_REF=<sha> to move deliberately, or re-clone for the verified tree."
+    fi
+fi
 if [ ! -x "${OFLM_BIN}" ]; then
     say INFO "configuring OpenFlowLM-Next..."
     # shellcheck disable=SC2086

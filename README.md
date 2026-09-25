@@ -13,8 +13,8 @@ Verified on Strix Halo (Ryzen AI Max+ 395, NPU FW 1.1.2.65, amdxdna 0.7, Linux 7
 
 | | Result |
 |---|---|
-| Decode | **~27 tok/s**, 42/42 layers resident |
-| Prefill | ~26–32 tok/s |
+| Decode | **~7 tok/s sustained** (145–160 ms/token), 42/42 layers resident |
+| Prefill | ~26–32 tok/s on an otherwise-idle NPU; ~7–8 tok/s if another NPU process is resident |
 | Correctness | `2+2`→`4`, `25*14`→`350`, capital of France→`Paris` |
 | Power | NPU-only; iGPU and CPU cores stay free |
 
@@ -70,15 +70,22 @@ curl -s http://127.0.0.1:8001/v1/chat/completions \
        "max_tokens":24,"temperature":0.0}'
 ```
 
-> **Always set a tight `max_tokens`.** The engine does not stop at
-> end-of-turn — it streams `<|im_end|>` until the cap. `stop` and
-> `stop_token_ids` are accepted but ignored. A 3-token answer costs 13 s at
-> `max_tokens: 300` versus 2 s at `max_tokens: 24`.
+> **No `max_tokens` needed.** Generation stops on `<|im_end|>` on its own
+> (`finish_reason: "stop"`), because the build restores the full EOS id set —
+> the Q4NX converter alone leaves `eos_token_id: [1]`, which would stream
+> `<|im_end|>` until the cap. `build_open_weights.sh` repairs and verifies it.
+> The sample above sets `max_tokens: 24` only as belt-and-braces.
 
 **Requirements:** Linux with an XDNA 2 NPU (`/dev/accel/accel0`), plus
 `cmake`, `g++`, `ninja`, `git`, `curl`, `python3`, and `apt-get` (used
-download-only, never installing). Roughly 25 GB of disk and ~8 GB of
+download-only, never installing). Roughly 28 GB of disk and ~8 GB of
 downloads for a full first run.
+
+**Reproducibility:** the engine tree, FastFlowLM release and model revision are
+pinned in `scripts/oflm_env.sh` (`OFLM_SRC_REF`, `FLM_VERSION`, `MODEL_REV`).
+`setup_oflm.sh` warns if your checkout has drifted from the pinned commit —
+that tree is what the verified numbers above were measured on. Override the
+variables to move forward deliberately.
 
 <details>
 <summary>Stuck? Common failures</summary>
@@ -254,7 +261,7 @@ the 42-layer runlist ERT error below. Prefill succeeds; no tokens are produced.
 ## 🧪 Serving via Open Kernels (Verified Working, Issue #1)
 
 > Independently verified on Strix Halo (Ryzen AI Max+ 395, FW 1.1.2.65):
-> 2+2→4, 25\*14→350, Paris — prefill ~26–32 tok/s, **decode ~27 tok/s**,
+> 2+2→4, 25\*14→350, Paris — prefill ~26–32 tok/s, **decode ~7 tok/s sustained**,
 > 42/42 layers resident. The closed-engine ERT analysis below does not apply
 > to this route. Original report by [@D-revv](https://github.com/D-revv) in
 > [#1](https://github.com/julianmb/minicpm5-xdna2/issues/1).
@@ -316,18 +323,17 @@ curl -s http://127.0.0.1:8001/v1/chat/completions -H "Content-Type: application/
   -d '{"model":"minicpm5:2b","messages":[{"role":"user","content":"What is 25*14? Answer with just the number."}],"max_tokens":30,"temperature":0.0}'
 ```
 
-Known cosmetic quirks: the model wraps answers in `<think>` chatter, and the
-open engine does not stop at end-of-turn — it streams `<|im_end|>` repeatedly
-until `max_tokens`. **Always bound `max_tokens` tightly**: a 3-token answer
-costs 13 s (~300 tokens at ~25 tok/s) instead of 2 s (`max_tokens: 24`).
+Known quirks: the model wraps answers in `<think>` chatter (stripped by the
+server's `reasoning_content` split). Generation stops correctly on `<|im_end|>`
+— see the EOS note above. `stop` and `stop_token_ids` are accepted by the API
+but not implemented by this runtime, so they do not truncate early.
 
-`stop` and `stop_token_ids` are accepted by the API but **ignored** by this
-runtime — `max_tokens` is the only working stop condition. (Measured: a stop
-string of `["<|im_end|>"]` and `stop_token_ids: [130073]` both still ran to
-the full 300-token cap.)
-
-This is a runtime stop-condition gap, not a model or weight problem — the
-answer text itself is correct.
+Sustained decode is **~7 tok/s** (145–160 ms/token), degrading slightly as
+context grows because attention runs on the host in this kernel set. The first
+token is much faster than the sustained rate, so short-answer benchmarks can
+badly overestimate throughput — quote the sustained figure. Prefill is
+contention-sensitive: a second NPU process (e.g. another `flm` service) drops
+it from ~30 tok/s to ~7–8.
 
 `OPEN_KERNELS_UNVALIDATED=1` is required (set by `oflm_env.sh`, sourced by
 both scripts) for the `(128,16,8,128)` attention tuple.

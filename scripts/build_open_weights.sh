@@ -65,8 +65,8 @@ if [ -d "${SRC_MODEL}" ]; then
 else
     SRC_DIR="${WORK_DIR}/MiniCPM5-2B-src"
     if ! ls "${SRC_DIR}"/*.safetensors >/dev/null 2>&1; then
-        echo "[INFO] Downloading ${SRC_MODEL}..."
-        "${PY}" -c "from huggingface_hub import snapshot_download; snapshot_download('${SRC_MODEL}', local_dir='${SRC_DIR}')"
+        echo "[INFO] Downloading ${SRC_MODEL}@${MODEL_REV}..."
+        "${PY}" -c "from huggingface_hub import snapshot_download; snapshot_download('${SRC_MODEL}', revision='${MODEL_REV}', local_dir='${SRC_DIR}')"
     fi
 fi
 
@@ -99,9 +99,33 @@ else
 fi
 
 echo "[INFO] Verifying container..."
+# The Q4NX converter rewrites tokenizer_config.json and leaves eos_token_id as
+# [1] only. MiniCPM5-2B ends a turn with <|im_end|> (id 130073), so without it
+# the runtime never sees an end token and streams <|im_end|> until max_tokens.
+# Restore the authoritative ids from this repo's MiniCPM5-2B spec.
+"${PY}" - "${OUT_DIR}/tokenizer_config.json" "${SCRIPT_DIR}/../configs/tokenizer_config.json" <<'EOF'
+import json, sys
+out_path, spec_path = sys.argv[1], sys.argv[2]
+out = json.load(open(out_path))
+spec = json.load(open(spec_path))
+changed = []
+for k in ("bos_token_id", "eos_token_id", "pad_token_id"):
+    if k in spec and out.get(k) != spec[k]:
+        changed.append(f"{k}: {out.get(k)!r} -> {spec[k]!r}")
+        out[k] = spec[k]
+if changed:
+    json.dump(out, open(out_path, "w"), indent=2)
+    print("[OK] restored token ids -- " + "; ".join(changed))
+else:
+    print("[OK] token ids already correct")
+assert 130073 in out["eos_token_id"], "eos_token_id must contain <|im_end|> (130073)"
+EOF
+
 "${PY}" - "${OUT_DIR}/model.q4nx" <<'EOF'
 import struct, json, sys
-h = json.loads(open(sys.argv[1],'rb').read(struct.unpack('<Q', open(sys.argv[1],'rb').read(8))[0]+8)[8:])
+with open(sys.argv[1],'rb') as f:
+    n = struct.unpack('<Q', f.read(8))[0]
+    h = json.loads(f.read(n))
 keys = [k for k in h if k != '__metadata__']
 assert not any('q_norm' in k or 'k_norm' in k for k in keys), "shim tensors present — wrong family!"
 print(f"[OK] {len(keys)} tensors, no q_norm/k_norm shim")
